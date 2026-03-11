@@ -1,20 +1,24 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { collection, doc, setDoc, deleteDoc, onSnapshot, query, where, addDoc, serverTimestamp, getDocs } from 'firebase/firestore';
+import { db } from '../lib/firebase';
 
 export function useWebRTC(
   roomId: string, 
+  userId: string,
+  userName: string,
+  userPhoto: string,
   onDataReceived: (data: any, userId: string) => void
 ) {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [connectedPeers, setConnectedPeers] = useState<string[]>([]);
   const [peerStates, setPeerStates] = useState<Record<string, RTCPeerConnectionState>>({});
+  const [peerProfiles, setPeerProfiles] = useState<Record<string, { name: string, photo: string }>>({});
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [mediaInitialized, setMediaInitialized] = useState(false);
   const [socketConnected, setSocketConnected] = useState(false);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   
-  const socketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Record<string, RTCPeerConnection>>({});
   const dataChannelsRef = useRef<Record<string, RTCDataChannel>>({});
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -22,6 +26,7 @@ export function useWebRTC(
   const screenVideoTrackRef = useRef<MediaStreamTrack | null>(null);
   const iceCandidateQueueRef = useRef<Record<string, RTCIceCandidateInit[]>>({});
   const onDataReceivedRef = useRef(onDataReceived);
+  const joinedAtRef = useRef<number>(Date.now());
 
   useEffect(() => {
     onDataReceivedRef.current = onDataReceived;
@@ -36,162 +41,180 @@ export function useWebRTC(
   }, []);
 
   useEffect(() => {
-    if (!roomId || !mediaInitialized) return;
+    if (!roomId || !userId || !mediaInitialized || !db) return;
 
-    socketRef.current = io({
-      transports: ['websocket', 'polling'],
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-    });
-
-    socketRef.current.on('connect', () => {
-      console.log('Connected to signaling server with ID:', socketRef.current?.id);
+    const setupSignaling = async () => {
       setSocketConnected(true);
-      socketRef.current?.emit('join-room', roomId);
-    });
+      joinedAtRef.current = Date.now();
 
-    socketRef.current.on('disconnect', () => {
-      console.log('Disconnected from signaling server');
-      setSocketConnected(false);
-    });
+      // 1. Add self to participants
+      const participantRef = doc(db, 'rooms', roomId, 'participants', userId);
+      await setDoc(participantRef, { 
+        joinedAt: joinedAtRef.current,
+        name: userName,
+        photo: userPhoto
+      });
 
-    socketRef.current.on('connect_error', (err) => {
-      // Socket.io will automatically try to reconnect
-      // Downgrade to warn to avoid cluttering the console with expected network blips
-      console.warn('Socket connection warning:', err.message);
-      setSocketConnected(false);
-    });
-
-    socketRef.current.on('room-users', async (users: string[]) => {
-      console.log('Existing users in room:', users);
-      for (const userId of users) {
-        if (userId !== socketRef.current?.id) {
-          await createPeerConnection(userId, true);
+      // 2. Get existing participants and connect to them (we are the initiator)
+      const participantsSnap = await getDocs(collection(db, 'rooms', roomId, 'participants'));
+      participantsSnap.forEach(async (docSnap) => {
+        const peerId = docSnap.id;
+        if (peerId !== userId) {
+          const peerData = docSnap.data();
+          setPeerProfiles(prev => ({ ...prev, [peerId]: { name: peerData.name || 'Unknown', photo: peerData.photo || '' } }));
+          // If they joined before us, we initiate the connection to them
+          if (peerData.joinedAt < joinedAtRef.current) {
+            await createPeerConnection(peerId, true);
+          }
         }
-      }
-    });
-
-    socketRef.current.on('user-connected', (userId) => {
-      console.log('User connected:', userId);
-      // We don't initiate here anymore. We wait for their offer.
-      // But we can set their initial state so the UI knows they are here.
-      setPeerStates(prev => ({ ...prev, [userId]: 'new' }));
-    });
-
-    socketRef.current.on('user-disconnected', (userId) => {
-      console.log('User disconnected:', userId);
-      if (peersRef.current[userId]) {
-        peersRef.current[userId].close();
-        delete peersRef.current[userId];
-      }
-      if (dataChannelsRef.current[userId]) {
-        delete dataChannelsRef.current[userId];
-      }
-      if (iceCandidateQueueRef.current[userId]) {
-        delete iceCandidateQueueRef.current[userId];
-      }
-      setRemoteStreams(prev => {
-        const newStreams = { ...prev };
-        delete newStreams[userId];
-        return newStreams;
       });
-      setPeerStates(prev => {
-        const newStates = { ...prev };
-        delete newStates[userId];
-        return newStates;
-      });
-      setConnectedPeers(prev => prev.filter(id => id !== userId));
-    });
 
-    socketRef.current.on('offer', async (payload) => {
-      console.log('Received offer from', payload.caller);
-      if (!peersRef.current[payload.caller]) {
-        await createPeerConnection(payload.caller, false);
-      }
-      const pc = peersRef.current[payload.caller];
-      if (pc) {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          
-          // Process queued ICE candidates
-          if (iceCandidateQueueRef.current[payload.caller]) {
-            for (const candidate of iceCandidateQueueRef.current[payload.caller]) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-              } catch (e) {
-                console.error('Error adding queued ice candidate', e);
+      // 3. Listen for new participants joining after us
+      const unsubscribeParticipants = onSnapshot(collection(db, 'rooms', roomId, 'participants'), (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          const peerId = change.doc.id;
+          if (peerId === userId) return;
+
+          if (change.type === 'added') {
+            const peerData = change.doc.data();
+            setPeerProfiles(prev => ({ ...prev, [peerId]: { name: peerData.name || 'Unknown', photo: peerData.photo || '' } }));
+            // If they joined after us, they will initiate, but we set their state to 'new'
+            if (peerData.joinedAt > joinedAtRef.current) {
+              setPeerStates(prev => ({ ...prev, [peerId]: 'new' }));
+            }
+          } else if (change.type === 'removed') {
+            handlePeerDisconnected(peerId);
+          }
+        });
+      });
+
+      // 4. Listen for incoming signals
+      const signalsQuery = query(collection(db, 'rooms', roomId, 'signals'), where('target', '==', userId));
+      const unsubscribeSignals = onSnapshot(signalsQuery, async (snapshot) => {
+        snapshot.docChanges().forEach(async (change) => {
+          if (change.type === 'added') {
+            const signal = change.doc.data();
+            const senderId = signal.sender;
+            
+            // Delete the signal after processing to keep the collection clean
+            deleteDoc(change.doc.ref).catch(console.error);
+
+            if (signal.type === 'offer') {
+              if (!peersRef.current[senderId]) {
+                await createPeerConnection(senderId, false);
+              }
+              const pc = peersRef.current[senderId];
+              if (pc) {
+                try {
+                  if (pc.signalingState !== 'stable') {
+                    console.warn(`Ignoring offer from ${senderId} because state is ${pc.signalingState}`);
+                    return;
+                  }
+                  await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+                  
+                  if (iceCandidateQueueRef.current[senderId]) {
+                    for (const candidate of iceCandidateQueueRef.current[senderId]) {
+                      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+                    }
+                    iceCandidateQueueRef.current[senderId] = [];
+                  }
+
+                  const answer = await pc.createAnswer();
+                  await pc.setLocalDescription(answer);
+                  sendSignal(senderId, 'answer', pc.localDescription);
+                } catch (err) {
+                  console.error('Error handling offer:', err);
+                }
+              }
+            } else if (signal.type === 'answer') {
+              const pc = peersRef.current[senderId];
+              if (pc) {
+                try {
+                  if (pc.signalingState !== 'have-local-offer') {
+                    console.warn(`Ignoring answer from ${senderId} because state is ${pc.signalingState}`);
+                    return;
+                  }
+                  await pc.setRemoteDescription(new RTCSessionDescription(signal.data));
+                  if (iceCandidateQueueRef.current[senderId]) {
+                    for (const candidate of iceCandidateQueueRef.current[senderId]) {
+                      try { await pc.addIceCandidate(new RTCIceCandidate(candidate)); } catch (e) {}
+                    }
+                    iceCandidateQueueRef.current[senderId] = [];
+                  }
+                } catch (err) {
+                  console.error('Error handling answer:', err);
+                }
+              }
+            } else if (signal.type === 'ice-candidate') {
+              const pc = peersRef.current[senderId];
+              if (pc) {
+                if (pc.remoteDescription) {
+                  try { await pc.addIceCandidate(new RTCIceCandidate(signal.data)); } catch (e) {}
+                } else {
+                  if (!iceCandidateQueueRef.current[senderId]) iceCandidateQueueRef.current[senderId] = [];
+                  iceCandidateQueueRef.current[senderId].push(signal.data);
+                }
               }
             }
-            iceCandidateQueueRef.current[payload.caller] = [];
           }
+        });
+      });
 
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          socketRef.current?.emit('answer', {
-            target: payload.caller,
-            caller: socketRef.current?.id,
-            sdp: pc.localDescription
-          });
-        } catch (err) {
-          console.error('Error handling offer:', err);
-        }
-      }
-    });
+      return () => {
+        unsubscribeParticipants();
+        unsubscribeSignals();
+        deleteDoc(participantRef).catch(console.error);
+      };
+    };
 
-    socketRef.current.on('answer', async (payload) => {
-      console.log('Received answer from', payload.caller);
-      const pc = peersRef.current[payload.caller];
-      if (pc) {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
-          
-          // Process queued ICE candidates
-          if (iceCandidateQueueRef.current[payload.caller]) {
-            for (const candidate of iceCandidateQueueRef.current[payload.caller]) {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(candidate));
-              } catch (e) {
-                console.error('Error adding queued ice candidate', e);
-              }
-            }
-            iceCandidateQueueRef.current[payload.caller] = [];
-          }
-        } catch (err) {
-          console.error('Error handling answer:', err);
-        }
-      }
-    });
-
-    socketRef.current.on('ice-candidate', async (incoming) => {
-      try {
-        const pc = peersRef.current[incoming.caller];
-        if (pc) {
-          if (pc.remoteDescription) {
-            await pc.addIceCandidate(new RTCIceCandidate(incoming.candidate));
-          } else {
-            if (!iceCandidateQueueRef.current[incoming.caller]) {
-              iceCandidateQueueRef.current[incoming.caller] = [];
-            }
-            iceCandidateQueueRef.current[incoming.caller].push(incoming.candidate);
-          }
-        }
-      } catch (e) {
-        console.error('Error adding received ice candidate', e);
-      }
-    });
+    const cleanup = setupSignaling();
 
     return () => {
-      socketRef.current?.disconnect();
+      cleanup.then(unsub => unsub && unsub());
       Object.values(peersRef.current).forEach(pc => pc.close());
       peersRef.current = {};
+      setSocketConnected(false);
     };
-  }, [roomId, mediaInitialized]);
+  }, [roomId, userId, mediaInitialized]);
+
+  const sendSignal = async (targetId: string, type: string, data: any) => {
+    if (!db) return;
+    try {
+      await addDoc(collection(db, 'rooms', roomId, 'signals'), {
+        sender: userId,
+        target: targetId,
+        type,
+        data: JSON.parse(JSON.stringify(data)), // Ensure it's a plain object
+        timestamp: serverTimestamp()
+      });
+    } catch (err) {
+      console.error('Error sending signal:', err);
+    }
+  };
+
+  const handlePeerDisconnected = (peerId: string) => {
+    if (peersRef.current[peerId]) {
+      peersRef.current[peerId].close();
+      delete peersRef.current[peerId];
+    }
+    if (dataChannelsRef.current[peerId]) delete dataChannelsRef.current[peerId];
+    if (iceCandidateQueueRef.current[peerId]) delete iceCandidateQueueRef.current[peerId];
+    
+    setRemoteStreams(prev => {
+      const newStreams = { ...prev };
+      delete newStreams[peerId];
+      return newStreams;
+    });
+    setPeerStates(prev => {
+      const newStates = { ...prev };
+      delete newStates[peerId];
+      return newStates;
+    });
+    setConnectedPeers(prev => prev.filter(id => id !== peerId));
+  };
 
   const createPeerConnection = async (targetUserId: string, isInitiator: boolean) => {
-    if (peersRef.current[targetUserId]) {
-      console.log('Peer connection already exists for', targetUserId);
-      return;
-    }
+    if (peersRef.current[targetUserId]) return;
 
     const configuration = {
       iceServers: [
@@ -209,34 +232,22 @@ export function useWebRTC(
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        socketRef.current?.emit('ice-candidate', {
-          target: targetUserId,
-          caller: socketRef.current?.id,
-          candidate: event.candidate
-        });
+        sendSignal(targetUserId, 'ice-candidate', event.candidate);
       }
     };
 
     pc.onconnectionstatechange = () => {
-      console.log(`Connection state with ${targetUserId}:`, pc.connectionState);
-      setPeerStates(prev => ({ ...prev, [targetUserId]: pc.connectionState }));
+      const state = pc.connectionState;
+      setPeerStates(prev => ({ ...prev, [targetUserId]: state }));
       
-      if (pc.connectionState === 'connected') {
+      if (state === 'connected') {
         setConnectedPeers(prev => prev.includes(targetUserId) ? prev : [...prev, targetUserId]);
-      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-        setConnectedPeers(prev => prev.filter(id => id !== targetUserId));
-        if (pc.connectionState === 'closed') {
-          setRemoteStreams(prev => {
-            const newStreams = { ...prev };
-            delete newStreams[targetUserId];
-            return newStreams;
-          });
-        }
+      } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+        handlePeerDisconnected(targetUserId);
       }
     };
 
     pc.ontrack = (event) => {
-      console.log('Received remote track from', targetUserId, event.track.kind);
       setRemoteStreams(prev => ({
         ...prev,
         [targetUserId]: event.streams[0]
@@ -262,11 +273,7 @@ export function useWebRTC(
       try {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
-        socketRef.current?.emit('offer', {
-          target: targetUserId,
-          caller: socketRef.current?.id,
-          sdp: pc.localDescription
-        });
+        sendSignal(targetUserId, 'offer', pc.localDescription);
       } catch (err) {
         console.error('Error creating offer:', err);
       }
@@ -276,14 +283,9 @@ export function useWebRTC(
   const setupDataChannel = (dc: RTCDataChannel, targetUserId: string) => {
     dataChannelsRef.current[targetUserId] = dc;
     dc.onopen = () => {
-      console.log('Data channel opened with', targetUserId);
-      setConnectedPeers(prev => {
-        if (!prev.includes(targetUserId)) return [...prev, targetUserId];
-        return prev;
-      });
+      setConnectedPeers(prev => prev.includes(targetUserId) ? prev : [...prev, targetUserId]);
     };
     dc.onclose = () => {
-      console.log('Data channel closed with', targetUserId);
       setConnectedPeers(prev => prev.filter(id => id !== targetUserId));
       delete dataChannelsRef.current[targetUserId];
     };
@@ -308,7 +310,6 @@ export function useWebRTC(
       console.error('Error accessing media devices.', err);
       setMediaError(err.message || 'Could not access camera/microphone.');
       
-      // Fallback to audio only
       try {
         const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
         setLocalStream(audioStream);
@@ -429,6 +430,7 @@ export function useWebRTC(
     remoteStreams, 
     connectedPeers,
     peerStates,
+    peerProfiles,
     mediaError,
     socketConnected,
     isScreenSharing,

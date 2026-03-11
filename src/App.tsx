@@ -6,11 +6,22 @@
 import React, { useState } from 'react';
 import { JoinRoom } from './components/JoinRoom';
 import { VideoChat } from './components/VideoChat';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { createOrJoinRoom } from './services/roomService';
 
-export default function App() {
+function AppContent() {
   const [roomId, setRoomId] = useState<string | null>(null);
+  const { currentUser } = useAuth();
 
-  const handleJoin = (id: string) => {
+  const handleJoin = async (id: string) => {
+    if (currentUser) {
+      try {
+        await createOrJoinRoom(id, currentUser);
+      } catch (error) {
+        console.error("Error creating/joining room in Firestore:", error);
+        // Continue anyway so the WebRTC part still works even if DB fails
+      }
+    }
     setRoomId(id);
   };
 
@@ -26,5 +37,13 @@ export default function App() {
         <JoinRoom onJoin={handleJoin} />
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
   );
 }
