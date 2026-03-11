@@ -1,5 +1,5 @@
 {
   "name": "Real-time Dubbing Video Chat",
   "description": "A professional video chat application with real-time voice translation and dubbing using Gemini.",
-  "requestFramePermissions": ["camera", "microphone"]
+  "requestFramePermissions": ["camera", "microphone", "display-capture"]
 }

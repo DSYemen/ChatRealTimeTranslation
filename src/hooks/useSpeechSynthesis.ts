@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 export function useSpeechSynthesis() {
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [isWarmedUp, setIsWarmedUp] = useState(false);
 
   useEffect(() => {
     const loadVoices = () => {
@@ -16,6 +17,15 @@ export function useSpeechSynthesis() {
     };
   }, []);
 
+  const warmup = useCallback(() => {
+    if (!isWarmedUp && window.speechSynthesis) {
+      const utterance = new SpeechSynthesisUtterance('');
+      utterance.volume = 0;
+      window.speechSynthesis.speak(utterance);
+      setIsWarmedUp(true);
+    }
+  }, [isWarmedUp]);
+
   const speak = useCallback((text: string, lang: string = 'en-US') => {
     if (!window.speechSynthesis) {
       console.warn("Speech synthesis not supported.");
@@ -27,6 +37,7 @@ export function useSpeechSynthesis() {
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = lang;
+    utterance.volume = 1;
 
     // Try to find a voice that matches the language
     const voice = voices.find(v => v.lang.startsWith(lang) || v.lang.startsWith(lang.split('-')[0]));
@@ -37,5 +48,5 @@ export function useSpeechSynthesis() {
     window.speechSynthesis.speak(utterance);
   }, [voices]);
 
-  return { speak, voices };
+  return { speak, voices, warmup };
 }

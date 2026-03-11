@@ -20,14 +20,23 @@ async function startServer() {
 
   const PORT = 3000;
 
+  const socketRooms = new Map<string, string>();
+
   // WebRTC Signaling
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
 
     socket.on("join-room", (roomId) => {
+      const room = io.sockets.adapter.rooms.get(roomId);
+      const existingUsers = room ? Array.from(room) : [];
+      
       socket.join(roomId);
+      socketRooms.set(socket.id, roomId);
+      
+      socket.emit("room-users", existingUsers);
       socket.to(roomId).emit("user-connected", socket.id);
-      console.log(`User ${socket.id} joined room ${roomId}`);
+      
+      console.log(`User ${socket.id} joined room ${roomId}. Existing users: ${existingUsers.length}`);
     });
 
     socket.on("offer", (payload) => {
@@ -44,7 +53,11 @@ async function startServer() {
 
     socket.on("disconnect", () => {
       console.log("User disconnected:", socket.id);
-      socket.broadcast.emit("user-disconnected", socket.id);
+      const roomId = socketRooms.get(socket.id);
+      if (roomId) {
+        socket.to(roomId).emit("user-disconnected", socket.id);
+        socketRooms.delete(socket.id);
+      }
     });
   });
 

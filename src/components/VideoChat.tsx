@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Mic, MicOff, Video, VideoOff, PhoneOff, Languages, Volume2, VolumeX, Users } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, PhoneOff, Languages, Users, Bot, Settings, X, Wifi, WifiOff, Loader2, AlertCircle, MonitorUp, MonitorOff } from 'lucide-react';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis';
@@ -10,56 +10,94 @@ interface VideoChatProps {
   onLeave: () => void;
 }
 
+function RemoteVideo({ stream, isDubbingEnabled }: { stream: MediaStream, isDubbingEnabled: boolean }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted={isDubbingEnabled}
+      className="w-full h-full object-cover"
+    />
+  );
+}
+
 export function VideoChat({ roomId, onLeave }: VideoChatProps) {
   const localVideoRef = useRef<HTMLVideoElement>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   
   const [isAudioEnabled, setIsAudioEnabled] = useState(true);
   const [isVideoEnabled, setIsVideoEnabled] = useState(true);
   const [isTranslationEnabled, setIsTranslationEnabled] = useState(false);
-  const [isRemoteRequestingTranscription, setIsRemoteRequestingTranscription] = useState(false);
+  const [isDubbingEnabled, setIsDubbingEnabled] = useState(false);
+  const [usersRequestingTranscription, setUsersRequestingTranscription] = useState<string[]>([]);
   const [selectedLanguage, setSelectedLanguage] = useState('ar-SA');
   const [myLanguage, setMyLanguage] = useState('en-US');
   
-  const [subtitles, setSubtitles] = useState<{ original: string, translated?: string } | null>(null);
+  const [subtitles, setSubtitles] = useState<Record<string, { original: string, translated?: string }>>({});
+  const [remoteStatuses, setRemoteStatuses] = useState<Record<string, { audio: boolean, video: boolean }>>({});
+  
+  const [showParticipants, setShowParticipants] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [subtitleSize, setSubtitleSize] = useState<'text-sm' | 'text-base' | 'text-lg'>('text-base');
+  const [subtitlePosition, setSubtitlePosition] = useState<'top-4' | 'bottom-4'>('bottom-4');
 
-  const { speak, voices } = useSpeechSynthesis();
+  const { speak, voices, warmup } = useSpeechSynthesis();
 
-  const handleDataReceived = useCallback(async (data: any) => {
+  const handleDataReceived = useCallback(async (data: any, userId: string) => {
     if (data.type === 'control') {
       if (data.action === 'enable_transcription') {
-        setIsRemoteRequestingTranscription(true);
+        setUsersRequestingTranscription(prev => prev.includes(userId) ? prev : [...prev, userId]);
       } else if (data.action === 'disable_transcription') {
-        setIsRemoteRequestingTranscription(false);
+        setUsersRequestingTranscription(prev => prev.filter(id => id !== userId));
       }
     } else if (data.type === 'speech') {
       const { text, lang } = data;
       
-      if (isTranslationEnabled) {
-        setSubtitles({ original: text, translated: 'Translating...' });
+      if (isTranslationEnabled || isDubbingEnabled) {
+        setSubtitles(prev => ({ ...prev, [userId]: { original: text, translated: 'Translating...' } }));
         const translated = await translateText(text, selectedLanguage);
-        setSubtitles({ original: text, translated });
-        speak(translated, selectedLanguage);
-      } else {
-        setSubtitles({ original: text });
+        setSubtitles(prev => ({ ...prev, [userId]: { original: text, translated } }));
+        
+        if (isDubbingEnabled) {
+          speak(translated, selectedLanguage);
+        }
       }
+    } else if (data.type === 'status') {
+      setRemoteStatuses(prev => ({
+        ...prev,
+        [userId]: { audio: data.audio, video: data.video }
+      }));
     }
-  }, [isTranslationEnabled, selectedLanguage, speak]);
+  }, [isTranslationEnabled, isDubbingEnabled, selectedLanguage, speak]);
 
   const {
     localStream,
-    remoteStream,
-    isConnected,
-    isDataChannelOpen,
+    remoteStreams,
+    connectedPeers,
+    peerStates,
     mediaError,
+    socketConnected,
+    isScreenSharing,
     startLocalStream,
     sendData,
     toggleAudio,
-    toggleVideo
+    toggleVideo,
+    toggleScreenShare
   } = useWebRTC(roomId, handleDataReceived);
 
+  const knownPeers = Object.keys(peerStates);
+  const isConnected = knownPeers.length > 0;
+  const isRemoteRequestingTranscription = usersRequestingTranscription.length > 0;
+
   const handleSpeechResult = useCallback((text: string) => {
-    // Send my speech to the other peer
     sendData({ type: 'speech', text, lang: myLanguage });
   }, [sendData, myLanguage]);
 
@@ -76,10 +114,12 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
   }, [localStream]);
 
   useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
+    if (!isConnected) {
+      setUsersRequestingTranscription([]);
+      setSubtitles({});
+      setRemoteStatuses({});
     }
-  }, [remoteStream]);
+  }, [isConnected]);
 
   useEffect(() => {
     if (isRemoteRequestingTranscription && isAudioEnabled) {
@@ -90,13 +130,19 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
   }, [isRemoteRequestingTranscription, isAudioEnabled, myLanguage, startListening, stopListening]);
 
   useEffect(() => {
-    if (isDataChannelOpen && isTranslationEnabled) {
+    if (connectedPeers.length > 0 && (isTranslationEnabled || isDubbingEnabled)) {
       sendData({
         type: 'control',
         action: 'enable_transcription'
       });
     }
-  }, [isDataChannelOpen, isTranslationEnabled, sendData]);
+  }, [connectedPeers, isTranslationEnabled, isDubbingEnabled, sendData]);
+
+  useEffect(() => {
+    if (connectedPeers.length > 0) {
+      sendData({ type: 'status', audio: isAudioEnabled, video: isVideoEnabled });
+    }
+  }, [connectedPeers, isAudioEnabled, isVideoEnabled, sendData]);
 
   const handleToggleAudio = () => {
     const newState = toggleAudio();
@@ -104,6 +150,7 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
   };
 
   const handleToggleVideo = () => {
+    if (isScreenSharing) return; // Prevent toggling camera while screen sharing
     const newState = toggleVideo();
     setIsVideoEnabled(newState);
   };
@@ -111,9 +158,25 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
   const handleToggleTranslation = () => {
     const newState = !isTranslationEnabled;
     setIsTranslationEnabled(newState);
+    if (!newState && !isDubbingEnabled) {
+      setSubtitles({});
+    }
     sendData({
       type: 'control',
-      action: newState ? 'enable_transcription' : 'disable_transcription'
+      action: (newState || isDubbingEnabled) ? 'enable_transcription' : 'disable_transcription'
+    });
+  };
+
+  const handleToggleDubbing = () => {
+    warmup();
+    const newState = !isDubbingEnabled;
+    setIsDubbingEnabled(newState);
+    if (!newState && !isTranslationEnabled) {
+      setSubtitles({});
+    }
+    sendData({
+      type: 'control',
+      action: (isTranslationEnabled || newState) ? 'enable_transcription' : 'disable_transcription'
     });
   };
 
@@ -128,8 +191,10 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
     { code: 'hi-IN', name: 'Hindi' },
   ];
 
+  const remoteUsersCount = knownPeers.length;
+
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col">
+    <div className="min-h-screen bg-zinc-950 flex flex-col relative">
       {/* Header */}
       <header className="bg-zinc-900 border-b border-zinc-800 px-6 py-4 flex items-center justify-between z-10">
         <div className="flex items-center gap-4">
@@ -138,10 +203,18 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
           </div>
           <div>
             <h1 className="text-white font-medium">Room: {roomId}</h1>
-            <div className="flex items-center gap-2">
-              <p className="text-zinc-400 text-xs flex items-center gap-2">
+            <div className="flex items-center gap-4">
+              <p className="text-zinc-400 text-xs flex items-center gap-1.5">
+                {socketConnected ? (
+                  <Wifi className="w-3.5 h-3.5 text-emerald-500" />
+                ) : (
+                  <WifiOff className="w-3.5 h-3.5 text-red-500" />
+                )}
+                {socketConnected ? 'Server Connected' : 'Connecting to Server...'}
+              </p>
+              <p className="text-zinc-400 text-xs flex items-center gap-1.5">
                 <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
-                {isConnected ? 'Connected' : 'Waiting for peer...'}
+                {isConnected ? `${remoteUsersCount} peer(s) found` : 'Waiting for peers...'}
               </p>
               {mediaError && (
                 <p className="text-red-400 text-xs flex items-center gap-1 bg-red-500/10 px-2 py-0.5 rounded">
@@ -180,95 +253,340 @@ export function VideoChat({ roomId, onLeave }: VideoChatProps) {
         </div>
       </header>
 
-      {/* Main Video Area */}
-      <main className="flex-1 relative p-4 flex items-center justify-center overflow-hidden">
-        {/* Remote Video (Full Screen) */}
-        <div className="absolute inset-4 bg-zinc-900 rounded-2xl overflow-hidden border border-zinc-800 shadow-2xl">
-          {remoteStream ? (
+      <div className="flex-1 flex overflow-hidden">
+        {/* Main Video Area */}
+        <main className="flex-1 relative p-4 flex items-center justify-center overflow-hidden">
+          {/* Remote Videos Grid */}
+          <div className="absolute inset-4 bg-zinc-900 rounded-2xl overflow-hidden border border-zinc-800 shadow-2xl">
+            {remoteUsersCount > 0 ? (
+              <div className={`w-full h-full grid gap-1 ${
+                remoteUsersCount === 1 ? 'grid-cols-1' : 
+                remoteUsersCount === 2 ? 'grid-cols-2' : 
+                remoteUsersCount <= 4 ? 'grid-cols-2 grid-rows-2' : 
+                'grid-cols-3 grid-rows-3'
+              }`}>
+                {knownPeers.map((userId) => {
+                  const stream = remoteStreams[userId];
+                  const state = peerStates[userId];
+                  
+                  return (
+                    <div key={userId} className="relative w-full h-full bg-black flex items-center justify-center">
+                      {stream ? (
+                        <RemoteVideo stream={stream} isDubbingEnabled={isDubbingEnabled} />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-zinc-500">
+                          {state === 'failed' || state === 'disconnected' ? (
+                            <>
+                              <AlertCircle className="w-12 h-12 mb-3 text-red-500/50" />
+                              <p className="text-sm text-red-400">Connection Failed</p>
+                              <p className="text-xs text-zinc-600 mt-1">Firewall or NAT issue</p>
+                            </>
+                          ) : state === 'connecting' || state === 'new' ? (
+                            <>
+                              <Loader2 className="w-12 h-12 mb-3 animate-spin text-emerald-500/50" />
+                              <p className="text-sm">Connecting...</p>
+                            </>
+                          ) : (
+                            <>
+                              <div className="w-16 h-16 bg-zinc-800 rounded-full flex items-center justify-center mb-3">
+                                <Users className="w-8 h-8 text-zinc-600" />
+                              </div>
+                              <p className="text-sm">No Video</p>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      
+                      {/* Subtitles for this user */}
+                      {subtitles[userId] && stream && (
+                        <div className={`absolute ${subtitlePosition} left-1/2 -translate-x-1/2 max-w-[90%] w-max px-4 z-20 text-center transition-all duration-300`}>
+                          <div className="bg-black/60 backdrop-blur-md rounded-2xl p-3 inline-block border border-white/10 shadow-xl">
+                            <p className="text-zinc-300 text-xs mb-1">{subtitles[userId].original}</p>
+                            {subtitles[userId].translated && (
+                              <p className={`text-emerald-400 font-medium ${subtitleSize}`}>{subtitles[userId].translated}</p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* User Status Overlay */}
+                      {stream && (
+                        <div className="absolute top-4 right-4 flex gap-2">
+                          {remoteStatuses[userId] && !remoteStatuses[userId].audio && (
+                            <div className="bg-black/50 backdrop-blur-sm p-1.5 rounded-lg">
+                              <MicOff className="w-4 h-4 text-red-500" />
+                            </div>
+                          )}
+                          {remoteStatuses[userId] && !remoteStatuses[userId].video && (
+                            <div className="bg-black/50 backdrop-blur-sm p-1.5 rounded-lg">
+                              <VideoOff className="w-4 h-4 text-red-500" />
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="w-full h-full flex flex-col items-center justify-center text-zinc-500">
+                <Users className="w-16 h-16 mb-4 opacity-20" />
+                <p>Waiting for someone to join...</p>
+              </div>
+            )}
+          </div>
+
+          {/* Local Video (PiP) */}
+          <div className="absolute bottom-8 right-8 w-48 aspect-video bg-zinc-800 rounded-xl overflow-hidden border-2 border-zinc-700 shadow-xl z-20 transition-all duration-300 hover:scale-105">
             <video
-              ref={remoteVideoRef}
+              ref={localVideoRef}
               autoPlay
               playsInline
-              className="w-full h-full object-cover"
+              muted
+              className={`w-full h-full object-cover ${isScreenSharing ? 'object-contain bg-black' : ''}`}
             />
-          ) : (
-            <div className="w-full h-full flex flex-col items-center justify-center text-zinc-500">
-              <Users className="w-16 h-16 mb-4 opacity-20" />
-              <p>Waiting for someone to join...</p>
-            </div>
-          )}
-        </div>
-
-        {/* Local Video (PiP) */}
-        <div className="absolute bottom-8 right-8 w-48 aspect-video bg-zinc-800 rounded-xl overflow-hidden border-2 border-zinc-700 shadow-xl z-20">
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-cover"
-          />
-          {!isVideoEnabled && (
-            <div className="absolute inset-0 bg-zinc-900 flex items-center justify-center">
-              <VideoOff className="w-6 h-6 text-zinc-500" />
-            </div>
-          )}
-        </div>
-
-        {/* Subtitles Overlay */}
-        {subtitles && (
-          <div className="absolute bottom-24 left-1/2 -translate-x-1/2 max-w-2xl w-full px-4 z-20 text-center">
-            <div className="bg-black/60 backdrop-blur-md rounded-2xl p-4 inline-block border border-white/10 shadow-2xl">
-              <p className="text-zinc-300 text-sm mb-1">{subtitles.original}</p>
-              {subtitles.translated && (
-                <p className="text-emerald-400 text-lg font-medium">{subtitles.translated}</p>
-              )}
-            </div>
+            {!isVideoEnabled && !isScreenSharing && (
+              <div className="absolute inset-0 bg-zinc-900 flex items-center justify-center">
+                <VideoOff className="w-6 h-6 text-zinc-500" />
+              </div>
+            )}
+            {!isAudioEnabled && (
+              <div className="absolute top-2 right-2 bg-black/50 backdrop-blur-sm p-1 rounded-md">
+                <MicOff className="w-3 h-3 text-red-500" />
+              </div>
+            )}
+            {isScreenSharing && (
+              <div className="absolute top-2 left-2 bg-blue-500/80 backdrop-blur-sm px-2 py-1 rounded-md flex items-center gap-1">
+                <MonitorUp className="w-3 h-3 text-white" />
+                <span className="text-[10px] font-medium text-white uppercase tracking-wider">Sharing</span>
+              </div>
+            )}
           </div>
+        </main>
+
+        {/* Participants Sidebar */}
+        {showParticipants && (
+          <aside className="w-80 bg-zinc-900 border-l border-zinc-800 flex flex-col z-20 shadow-2xl">
+            <div className="p-4 border-b border-zinc-800 flex items-center justify-between">
+              <h2 className="text-white font-medium flex items-center gap-2">
+                <Users className="w-5 h-5 text-emerald-500" />
+                Participants ({remoteUsersCount + 1})
+              </h2>
+              <button onClick={() => setShowParticipants(false)} className="text-zinc-400 hover:text-white transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {/* Local User */}
+              <div className="flex items-center justify-between bg-zinc-800/50 p-3 rounded-xl border border-zinc-700/50">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-emerald-500/20 rounded-full flex items-center justify-center text-emerald-500 font-medium">
+                    You
+                  </div>
+                  <span className="text-white text-sm font-medium">You</span>
+                </div>
+                <div className="flex items-center gap-2 text-zinc-400">
+                  {isAudioEnabled ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4 text-red-400" />}
+                  {isScreenSharing ? <MonitorUp className="w-4 h-4 text-blue-400" /> : (isVideoEnabled ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4 text-red-400" />)}
+                </div>
+              </div>
+
+              {/* Remote Users */}
+              {knownPeers.map((userId, index) => {
+                const status = remoteStatuses[userId] || { audio: true, video: true };
+                const state = peerStates[userId];
+                return (
+                  <div key={userId} className="flex items-center justify-between bg-zinc-800/50 p-3 rounded-xl border border-zinc-700/50">
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 bg-blue-500/20 rounded-full flex items-center justify-center text-blue-500 font-medium">
+                        P{index + 1}
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-white text-sm font-medium">Peer {index + 1}</span>
+                        <span className={`text-xs ${state === 'connected' ? 'text-emerald-500' : state === 'failed' ? 'text-red-500' : 'text-amber-500'}`}>
+                          {state}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 text-zinc-400">
+                      {status.audio ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4 text-red-400" />}
+                      {status.video ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4 text-red-400" />}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </aside>
         )}
-      </main>
+      </div>
 
       {/* Controls */}
       <footer className="bg-zinc-900 border-t border-zinc-800 p-6 flex justify-center gap-4 z-10">
         <button
           onClick={handleToggleAudio}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
             isAudioEnabled ? 'bg-zinc-800 hover:bg-zinc-700 text-white' : 'bg-red-500/20 text-red-500 hover:bg-red-500/30'
           }`}
         >
           {isAudioEnabled ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            {isAudioEnabled ? "Mute Microphone" : "Unmute Microphone"}
+          </span>
         </button>
 
         <button
           onClick={handleToggleVideo}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
+          disabled={isScreenSharing}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
+            isScreenSharing ? 'bg-zinc-800/50 text-zinc-600 cursor-not-allowed' :
             isVideoEnabled ? 'bg-zinc-800 hover:bg-zinc-700 text-white' : 'bg-red-500/20 text-red-500 hover:bg-red-500/30'
           }`}
         >
           {isVideoEnabled ? <Video className="w-6 h-6" /> : <VideoOff className="w-6 h-6" />}
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            {isScreenSharing ? "Camera disabled while sharing" : isVideoEnabled ? "Turn Off Camera" : "Turn On Camera"}
+          </span>
         </button>
 
         <button
+          onClick={toggleScreenShare}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
+            isScreenSharing 
+              ? 'bg-blue-500 text-white shadow-[0_0_20px_rgba(59,130,246,0.4)]' 
+              : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
+          }`}
+        >
+          {isScreenSharing ? <MonitorOff className="w-6 h-6" /> : <MonitorUp className="w-6 h-6" />}
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            {isScreenSharing ? "Stop Sharing" : "Share Screen"}
+          </span>
+        </button>
+
+        <div className="w-px h-14 bg-zinc-800 mx-2"></div>
+
+        <button
           onClick={handleToggleTranslation}
-          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all ${
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
             isTranslationEnabled 
+              ? 'bg-blue-500 text-white shadow-[0_0_20px_rgba(59,130,246,0.4)]' 
+              : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
+          }`}
+        >
+          <Languages className="w-6 h-6" />
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            {isTranslationEnabled ? "Disable Subtitles" : "Enable Subtitles"}
+          </span>
+        </button>
+
+        <button
+          onClick={handleToggleDubbing}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
+            isDubbingEnabled 
               ? 'bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.4)]' 
               : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
           }`}
-          title={isTranslationEnabled ? "Disable Dubbing" : "Enable Dubbing"}
         >
-          <Languages className="w-6 h-6" />
+          <Bot className="w-6 h-6" />
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            {isDubbingEnabled ? "Disable AI Voice (Unmute Peer)" : "Enable AI Voice (Mute Peer)"}
+          </span>
+        </button>
+
+        <div className="w-px h-14 bg-zinc-800 mx-2"></div>
+
+        <button
+          onClick={() => setShowParticipants(!showParticipants)}
+          className={`w-14 h-14 rounded-full flex items-center justify-center transition-all relative group ${
+            showParticipants 
+              ? 'bg-zinc-700 text-white' 
+              : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
+          }`}
+        >
+          <Users className="w-6 h-6" />
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            Participants
+          </span>
+        </button>
+
+        <button
+          onClick={() => setShowSettings(true)}
+          className="w-14 h-14 rounded-full bg-zinc-800 hover:bg-zinc-700 text-zinc-400 flex items-center justify-center transition-all relative group"
+        >
+          <Settings className="w-6 h-6" />
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            Settings
+          </span>
         </button>
 
         <div className="w-px h-14 bg-zinc-800 mx-2"></div>
 
         <button
           onClick={onLeave}
-          className="w-14 h-14 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center transition-all shadow-[0_0_20px_rgba(239,68,68,0.4)]"
+          className="w-14 h-14 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center transition-all shadow-[0_0_20px_rgba(239,68,68,0.4)] relative group"
         >
           <PhoneOff className="w-6 h-6" />
+          <span className="absolute -top-10 bg-zinc-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none">
+            End Call
+          </span>
         </button>
       </footer>
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="absolute inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-lg font-medium text-white flex items-center gap-2">
+                <Settings className="w-5 h-5 text-emerald-500" />
+                Subtitle Settings
+              </h2>
+              <button onClick={() => setShowSettings(false)} className="text-zinc-400 hover:text-white transition-colors">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-sm font-medium text-zinc-300 mb-3">Font Size</h3>
+                <div className="flex gap-2">
+                  {(['text-sm', 'text-base', 'text-lg'] as const).map(size => (
+                    <button
+                      key={size}
+                      onClick={() => setSubtitleSize(size)}
+                      className={`flex-1 py-2 rounded-lg border transition-colors ${
+                        subtitleSize === size 
+                          ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400' 
+                          : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700'
+                      }`}
+                    >
+                      {size === 'text-sm' ? 'Small' : size === 'text-base' ? 'Medium' : 'Large'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-sm font-medium text-zinc-300 mb-3">Position</h3>
+                <div className="flex gap-2">
+                  {(['top-4', 'bottom-4'] as const).map(pos => (
+                    <button
+                      key={pos}
+                      onClick={() => setSubtitlePosition(pos)}
+                      className={`flex-1 py-2 rounded-lg border transition-colors ${
+                        subtitlePosition === pos 
+                          ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400' 
+                          : 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700'
+                      }`}
+                    >
+                      {pos === 'top-4' ? 'Top' : 'Bottom'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
